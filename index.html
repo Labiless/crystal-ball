@@ -57,6 +57,7 @@
   button:disabled { opacity: .4; cursor: not-allowed; }
   button.secondary { background: #3d2763; }
   [hidden] { display: none !important; }
+  #video.mirrored { transform: scaleX(-1); }
   #video { display: block; width: 100%; border-radius: 8px; margin-top: 12px; background: #000; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
   #status { font-size: .9rem; color: var(--muted); }
@@ -110,6 +111,7 @@
       <video id="video" autoplay playsinline muted></video>
       <div class="row">
         <div><button id="captureBtn">Capture</button></div>
+        <div id="switchCameraWrap" hidden><button id="switchCameraBtn" class="secondary">🔄 Switch</button></div>
         <div><button id="cancelCameraBtn" class="secondary">Cancel</button></div>
       </div>
     </div>
@@ -143,6 +145,7 @@ const $ = (id) => document.getElementById(id);
 let printerChar = null;
 let photo = null;
 let stream = null;
+let facingMode = 'environment';
 
 function setStatus(msg, kind = '') {
   $('status').textContent = msg;
@@ -315,19 +318,32 @@ async function openCamera() {
     return;
   }
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    stopStream();
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: false });
     $('video').srcObject = stream;
+    $('video').classList.toggle('mirrored', facingMode === 'user');
     $('cameraView').hidden = false;
     $('cameraBtn').hidden = true;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    $('switchCameraWrap').hidden = devices.filter(d => d.kind === 'videoinput').length < 2;
   } catch (e) {
     setStatus('Camera unavailable: ' + e.message, 'err');
     $('photoInput').click();
   }
 }
 
-function closeCamera() {
+function stopStream() {
   stream?.getTracks().forEach(t => t.stop());
   stream = null;
+}
+
+function switchCamera() {
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+  openCamera();
+}
+
+function closeCamera() {
+  stopStream();
   $('video').srcObject = null;
   $('cameraView').hidden = true;
   $('cameraBtn').hidden = false;
@@ -365,6 +381,7 @@ $('connectBtn').addEventListener('click', connect);
 $('printBtn').addEventListener('click', () => printCanvas(renderText()));
 $('cameraBtn').addEventListener('click', openCamera);
 $('captureBtn').addEventListener('click', capturePhoto);
+$('switchCameraBtn').addEventListener('click', switchCamera);
 $('cancelCameraBtn').addEventListener('click', closeCamera);
 $('printPhotoBtn').addEventListener('click', () => printCanvas(renderPhoto()));
 $('photoInput').addEventListener('change', async (e) => {
