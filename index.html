@@ -63,6 +63,12 @@
   #status { font-size: .9rem; color: var(--muted); }
   #status.ok { color: var(--ok); }
   #status.err { color: var(--err); }
+  #printerInfo { margin-top: 10px; font-size: .9rem; }
+  #printerInfo summary { cursor: pointer; color: var(--muted); }
+  #printerInfo dl { margin: 10px 0 0; }
+  #printerInfo dt { font-size: .8rem; color: var(--muted); }
+  #printerInfo dd { margin: 2px 0 10px; font-family: ui-monospace, Menlo, monospace; word-break: break-all; user-select: all; }
+  #printerName { font-size: 1.3rem; font-weight: 600; }
   canvas.preview {
     display: block;
     width: 100%;
@@ -80,28 +86,23 @@
   <section>
     <div id="status">Printer not connected</div>
     <button id="connectBtn" class="secondary">Connect printer</button>
-    <div class="row">
-      <div>
-        <label for="width">Paper width</label>
-        <select id="width">
-          <option value="384">58 mm (384 dots)</option>
-          <option value="576">80 mm (576 dots)</option>
-        </select>
-      </div>
-    </div>
+    <details id="printerInfo" hidden>
+      <summary>Printer details</summary>
+      <dl>
+        <dt>Printer name (use this for the ESP32)</dt>
+        <dd id="printerName"></dd>
+        <dt>BLE service</dt>
+        <dd id="printerService"></dd>
+        <dt>Characteristic</dt>
+        <dd id="printerChar"></dd>
+      </dl>
+    </details>
   </section>
 
   <section>
     <label for="text">Phrase to print</label>
-    <textarea id="text" placeholder="I see a long journey in your future…"></textarea>
-    <div class="row">
-      <div>
-        <label for="fontSize">Text size</label>
-        <input id="fontSize" type="number" min="16" max="80" value="32">
-      </div>
-    </div>
-    <canvas id="preview" class="preview"></canvas>
-    <button id="printBtn" class="print" disabled>Print phrase</button>
+    <textarea id="text" placeholder="Leave empty to print a random phrase…"></textarea>
+    <button id="printBtn" class="print" disabled>Print random phrase</button>
   </section>
 
   <section>
@@ -130,6 +131,7 @@
   </section>
 </main>
 
+<script src="phrases.js"></script>
 <script>
 // Common BLE services exposed by cheap ESC/POS thermal printers.
 const PRINTER_SERVICES = [
@@ -141,11 +143,17 @@ const PRINTER_SERVICES = [
   '0000ae30-0000-1000-8000-00805f9b34fb',
 ];
 
+const PAPER_WIDTH = 384; // 58 mm paper at 203 dpi
 const $ = (id) => document.getElementById(id);
 let printerChar = null;
 let photo = null;
 let stream = null;
 let facingMode = 'environment';
+let lastPhraseIndex = -1;
+
+const decoration = new Image();
+decoration.src = 'decoration.png';
+decoration.onload = () => renderPhoto();
 
 function setStatus(msg, kind = '') {
   $('status').textContent = msg;
@@ -166,6 +174,8 @@ async function connect() {
     device.addEventListener('gattserverdisconnected', () => {
       printerChar = null;
       updateButtons();
+      $('printerInfo').hidden = true;
+      $('connectBtn').hidden = false;
       setStatus('Printer disconnected', 'err');
     });
     const server = await device.gatt.connect();
@@ -175,13 +185,17 @@ async function connect() {
       const writable = chars.find(c => c.properties.writeWithoutResponse || c.properties.write);
       if (writable) {
         printerChar = writable;
-        console.log('Service:', service.uuid, 'Characteristic:', writable.uuid);
+        $('printerService').textContent = service.uuid;
+        $('printerChar').textContent = writable.uuid;
         break;
       }
     }
     if (!printerChar) throw new Error('no writable characteristic found');
     updateButtons();
-    setStatus(`Connected to ${device.name || 'printer'}`, 'ok');
+    $('printerName').textContent = device.name || '(no name)';
+    $('printerInfo').hidden = false;
+    $('connectBtn').hidden = true;
+    setStatus('Printer connected', 'ok');
   } catch (e) {
     setStatus('Connection failed: ' + e.message, 'err');
   }
@@ -205,17 +219,17 @@ function wrapLines(ctx, text, maxWidth) {
   return lines;
 }
 
-function renderText() {
-  const canvas = $('preview');
+function renderText(text) {
+  const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
-  const width = parseInt($('width').value, 10);
-  const fontSize = parseInt($('fontSize').value, 10) || 32;
+  const width = PAPER_WIDTH;
+  const fontSize = 32;
   const padding = 8;
   const lineHeight = Math.round(fontSize * 1.25);
   const font = `bold ${fontSize}px Georgia, serif`;
 
   ctx.font = font;
-  const lines = wrapLines(ctx, $('text').value.trim() || ' ', width - padding * 2);
+  const lines = wrapLines(ctx, text, width - padding * 2);
 
   canvas.width = width;
   canvas.height = lines.length * lineHeight + padding * 2;
@@ -231,16 +245,39 @@ function renderText() {
   return canvas;
 }
 
+// Puts the decoration above the content and a vertically flipped copy below it.
+function addFrame(content, target = document.createElement('canvas')) {
+  const width = PAPER_WIDTH;
+  const decoHeight = decoration.naturalWidth
+    ? Math.round(decoration.naturalHeight * width / decoration.naturalWidth)
+    : 0;
+  const gap = decoHeight ? 8 : 0;
+  target.width = width;
+  target.height = content.height + (decoHeight + gap) * 2;
+  const ctx = target.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, target.width, target.height);
+  ctx.drawImage(content, 0, decoHeight + gap);
+  if (decoHeight) {
+    ctx.drawImage(decoration, 0, 0, width, decoHeight);
+    ctx.save();
+    ctx.translate(0, target.height);
+    ctx.scale(1, -1);
+    ctx.drawImage(decoration, 0, 0, width, decoHeight);
+    ctx.restore();
+  }
+  return target;
+}
+
 // Fits the photo to the paper width, applies brightness/contrast and Floyd–Steinberg dithering to pure black and white.
 function renderPhoto() {
   if (!photo) return null;
-  const canvas = $('photoPreview');
+  const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
-  const width = parseInt($('width').value, 10);
+  const width = PAPER_WIDTH;
   const height = Math.round(photo.height * width / photo.width);
   canvas.width = width;
   canvas.height = height;
-  canvas.hidden = false;
   ctx.drawImage(photo, 0, 0, width, height);
 
   const brightness = parseInt($('brightness').value, 10);
@@ -271,10 +308,12 @@ function renderPhoto() {
     px[i * 4 + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
-  return canvas;
+  $('photoPreview').hidden = false;
+  return addFrame(canvas, $('photoPreview'));
 }
 
 // Converts a canvas to ESC/POS "GS v 0" raster commands, in bands so the printer buffer doesn't overflow.
+// The image is rotated 180° so the receipt reads correctly from the side it comes out of.
 function canvasToEscPos(canvas) {
   const { width, height } = canvas;
   const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
@@ -287,7 +326,7 @@ function canvasToEscPos(canvas) {
     band.set([0x1d, 0x76, 0x30, 0x00, bytesPerRow & 0xff, bytesPerRow >> 8, rows & 0xff, rows >> 8]);
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < width; x++) {
-        const i = ((y0 + y) * width + x) * 4;
+        const i = ((height - 1 - (y0 + y)) * width + (width - 1 - x)) * 4;
         const lum = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
         if (lum < 128) band[8 + y * bytesPerRow + (x >> 3)] |= 0x80 >> (x & 7);
       }
@@ -356,13 +395,33 @@ async function capturePhoto() {
   updateButtons();
 }
 
+function randomPhrase() {
+  let i;
+  do { i = Math.floor(Math.random() * PHRASES.length); } while (i === lastPhraseIndex && PHRASES.length > 1);
+  lastPhraseIndex = i;
+  return PHRASES[i];
+}
+
+async function printPhrase() {
+  const typed = $('text').value.trim();
+  const printed = await printCanvas(addFrame(renderText(typed || randomPhrase())));
+  if (printed && typed) {
+    $('text').value = '';
+    updatePrintLabel();
+  }
+}
+
+function updatePrintLabel() {
+  $('printBtn').textContent = $('text').value.trim() ? 'Print phrase' : 'Print random phrase';
+}
+
 function updateButtons(busy = false) {
   $('printBtn').disabled = busy || !printerChar;
   $('printPhotoBtn').disabled = busy || !printerChar || !photo;
 }
 
 async function printCanvas(canvas) {
-  if (!printerChar || !canvas) return;
+  if (!printerChar || !canvas) return false;
   updateButtons(true);
   try {
     setStatus('Printing…');
@@ -370,15 +429,18 @@ async function printCanvas(canvas) {
     for (const band of canvasToEscPos(canvas)) await send(band);
     await send(new Uint8Array([0x1b, 0x64, 0x04]));    // ESC d 4 : feed 4 lines
     setStatus('Printed ✨', 'ok');
+    return true;
   } catch (e) {
     setStatus('Print error: ' + e.message, 'err');
+    return false;
   } finally {
     updateButtons();
   }
 }
 
 $('connectBtn').addEventListener('click', connect);
-$('printBtn').addEventListener('click', () => printCanvas(renderText()));
+$('printBtn').addEventListener('click', printPhrase);
+$('text').addEventListener('input', updatePrintLabel);
 $('cameraBtn').addEventListener('click', openCamera);
 $('captureBtn').addEventListener('click', capturePhoto);
 $('switchCameraBtn').addEventListener('click', switchCamera);
@@ -392,10 +454,7 @@ $('photoInput').addEventListener('change', async (e) => {
   updateButtons();
   e.target.value = '';
 });
-['text', 'fontSize'].forEach(id => $(id).addEventListener('input', renderText));
 ['brightness', 'contrast'].forEach(id => $(id).addEventListener('input', renderPhoto));
-$('width').addEventListener('input', () => { renderText(); renderPhoto(); });
-renderText();
 </script>
 </body>
 </html>
