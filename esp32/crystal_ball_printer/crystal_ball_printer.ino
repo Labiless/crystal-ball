@@ -1,14 +1,23 @@
-// Crystal Ball – prints a random fortune on a BLE ESC/POS thermal printer when the button is pressed.
+// Crystal Ball – prints a random fortune on a BLE ESC/POS thermal printer when the button is pressed,
+// and forwards print jobs from the webapp (esp32.html) to the same printer.
 // Requires the "NimBLE-Arduino" (version 2.x) and "Adafruit GFX Library" libraries.
 
 #include <NimBLEDevice.h>
 #include <Adafruit_GFX.h>
 #include <Fonts/FreeSerifBold18pt7b.h>
 #include <vector>
+#include <atomic>
 #include "decoration.h"
 
 // Part of the printer's Bluetooth name (case-sensitive). Leave empty to only list nearby devices on the Serial Monitor.
 const char* PRINTER_NAME = "MPT-II";
+
+// Bluetooth name the webapp sees. The UUIDs must match the ones in esp32.html.
+const char* BRIDGE_NAME = "Crystal Ball";
+const char* BRIDGE_SERVICE_UUID = "6e7c0001-8f1a-4c7e-9b1d-2a9c8b7f5e01";
+const char* JOB_CHAR_UUID       = "6e7c0002-8f1a-4c7e-9b1d-2a9c8b7f5e01";
+const char* STATUS_CHAR_UUID    = "6e7c0003-8f1a-4c7e-9b1d-2a9c8b7f5e01";
+const size_t MAX_JOB_SIZE = 100 * 1024;
 
 const int BUTTON_PIN = 4;
 const int PAPER_WIDTH = 384;     // 58 mm paper at 203 dpi
@@ -230,6 +239,100 @@ void printFortune() {
   printCanvas(canvas);
 }
 
+// ---------- Webapp bridge ----------
+// The webapp sends a complete ESC/POS job on the job characteristic:
+//   [0x01, size as uint32 little-endian]  starts a job
+//   [0x02, data...]                       appends data; the job is printed once `size` bytes arrived
+// The status characteristic notifies: "ready", "offline", "printing", "done", "busy", "error".
+
+NimBLECharacteristic* statusChar = nullptr;
+uint8_t* jobBuffer = nullptr;
+size_t jobSize = 0;
+size_t jobReceived = 0;
+std::atomic<bool> jobReady{false};
+
+void notifyStatus(const char* status) {
+  Serial.printf("Bridge status: %s\n", status);
+  statusChar->setValue(status);
+  statusChar->notify();
+}
+
+void discardJob() {
+  free(jobBuffer);
+  jobBuffer = nullptr;
+  jobSize = jobReceived = 0;
+}
+
+class JobCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo) override {
+    const NimBLEAttValue& value = chr->getValue();
+    const uint8_t* data = value.data();
+    size_t len = value.length();
+    if (len == 0) return;
+    if (jobReady) {
+      notifyStatus("busy");
+      return;
+    }
+    if (data[0] == 0x01 && len >= 5) {
+      uint32_t size = data[1] | data[2] << 8 | data[3] << 16 | (uint32_t)data[4] << 24;
+      discardJob();
+      if (size == 0 || size > MAX_JOB_SIZE || !(jobBuffer = (uint8_t*)malloc(size))) {
+        notifyStatus("error");
+        return;
+      }
+      jobSize = size;
+    } else if (data[0] == 0x02 && jobBuffer) {
+      size_t n = min(len - 1, jobSize - jobReceived);
+      memcpy(jobBuffer + jobReceived, data + 1, n);
+      jobReceived += n;
+      if (jobReceived == jobSize) jobReady = true;
+    }
+  }
+};
+
+class BridgeServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    Serial.println("Webapp connected.");
+  }
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+    Serial.println("Webapp disconnected.");
+    if (!jobReady) discardJob();
+  }
+};
+
+void startBridge() {
+  NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new BridgeServerCallbacks());
+  server->advertiseOnDisconnect(true);
+
+  NimBLEService* service = server->createService(BRIDGE_SERVICE_UUID);
+  NimBLECharacteristic* jobChar = service->createCharacteristic(
+      JOB_CHAR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  jobChar->setCallbacks(new JobCallbacks());
+  statusChar = service->createCharacteristic(STATUS_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  statusChar->setValue("offline");
+  server->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->enableScanResponse(true);
+  adv->setName(BRIDGE_NAME);
+  adv->addServiceUUID(BRIDGE_SERVICE_UUID);
+  adv->start();
+  Serial.printf("Advertising as \"%s\" for the webapp.\n", BRIDGE_NAME);
+}
+
+void printPendingJob() {
+  if (!jobReady) return;
+  if (isConnected()) {
+    notifyStatus("printing");
+    notifyStatus(sendBytes(jobBuffer, jobSize) ? "done" : "error");
+  } else {
+    notifyStatus("error");
+  }
+  discardJob();
+  jobReady = false;
+}
+
 // ---------- LED ----------
 
 // Boards with an onboard RGB LED (ESP32-S3/C3/C6) cycle through colors; classic ESP32 boards toggle the LED.
@@ -253,8 +356,9 @@ void setup() {
 #ifndef RGB_BUILTIN
   pinMode(LED_PIN, OUTPUT);
 #endif
-  NimBLEDevice::init("");
+  NimBLEDevice::init(BRIDGE_NAME);
   NimBLEDevice::setMTU(517);
+  startBridge();
   connectToPrinter();
 }
 
@@ -262,6 +366,15 @@ void loop() {
   static unsigned long lastRetry = 0;
   static bool lastPressed = false;
   static unsigned long lastChange = 0;
+  static int lastPrinterState = -1;
+
+  int printerState = isConnected();
+  if (printerState != lastPrinterState) {
+    lastPrinterState = printerState;
+    notifyStatus(printerState ? "ready" : "offline");
+  }
+
+  printPendingJob();
 
   if (!isConnected() && millis() - lastRetry > 10000) {
     lastRetry = millis();

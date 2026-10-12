@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Ball ESP32</title>
+<style>
+  :root {
+    --bg: #14091f;
+    --panel: #22123a;
+    --text: #f1e9ff;
+    --muted: #a995c9;
+    --accent: #b36bff;
+    --ok: #5fd38d;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  main { max-width: 520px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; text-align: center; }
+  .subtitle { margin: 0 0 16px; text-align: center; color: var(--muted); font-size: .9rem; }
+  section {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 6px; }
+  textarea, select, input[type=number] {
+    width: 100%;
+    font: inherit;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #3d2763;
+    background: #170b29;
+    color: var(--text);
+  }
+  textarea { min-height: 100px; resize: vertical; }
+  .row { display: flex; gap: 12px; margin-top: 12px; }
+  .row > div { flex: 1; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    width: 100%;
+    padding: 12px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    margin-top: 12px;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.secondary { background: #3d2763; }
+  [hidden] { display: none !important; }
+  #video.mirrored { transform: scaleX(-1); }
+  #video { display: block; width: 100%; border-radius: 8px; margin-top: 12px; background: #000; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  #status { font-size: .9rem; color: var(--muted); }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  #printerInfo { margin-top: 10px; font-size: .9rem; }
+  #printerInfo summary { cursor: pointer; color: var(--muted); }
+  #printerInfo dl { margin: 10px 0 0; }
+  #printerInfo dt { font-size: .8rem; color: var(--muted); }
+  #printerInfo dd { margin: 2px 0 10px; font-family: ui-monospace, Menlo, monospace; word-break: break-all; user-select: all; }
+  #printerName { font-size: 1.3rem; font-weight: 600; }
+  canvas.preview {
+    display: block;
+    width: 100%;
+    background: #fff;
+    border-radius: 4px;
+    margin-top: 12px;
+    image-rendering: pixelated;
+  }
+  #loader {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    padding: 16px;
+    background: rgba(10, 4, 18, .85);
+    backdrop-filter: blur(4px);
+    text-align: center;
+  }
+  .orb {
+    width: 110px;
+    height: 110px;
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at 35% 30%, rgba(255, 255, 255, .7), transparent 25%),
+      conic-gradient(from 0deg, #6a2bb8, #b36bff, #3d8bff, #6a2bb8);
+    box-shadow: 0 0 40px 8px rgba(179, 107, 255, .5);
+    animation: spin 3s linear infinite, glow 1.6s ease-in-out infinite alternate;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes glow { to { box-shadow: 0 0 70px 18px rgba(179, 107, 255, .8); } }
+  #loaderText { font-size: 1.1rem; font-weight: 600; }
+  .progress {
+    width: min(280px, 100%);
+    height: 8px;
+    border-radius: 4px;
+    background: #3d2763;
+    overflow: hidden;
+  }
+  #progressBar {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    transition: width .2s;
+  }
+  .progress.indeterminate #progressBar {
+    width: 40%;
+    transition: none;
+    animation: slide 1.2s ease-in-out infinite;
+  }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  #loaderDetail { font-size: .85rem; color: var(--muted); min-height: 1.2em; }
+  @media (prefers-reduced-motion: reduce) {
+    .orb, .progress.indeterminate #progressBar { animation: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>🔮 Crystal Ball</h1>
+  <p class="subtitle">Printing through the ESP32</p>
+
+  <section>
+    <div id="status">ESP32 not connected</div>
+    <button id="connectBtn" class="secondary">Connect to ESP32</button>
+    <details id="printerInfo" hidden>
+      <summary>ESP32 details</summary>
+      <dl>
+        <dt>ESP32 name</dt>
+        <dd id="printerName"></dd>
+        <dt>Printer</dt>
+        <dd id="printerState"></dd>
+      </dl>
+    </details>
+  </section>
+
+  <section>
+    <label for="text">Phrase to print</label>
+    <textarea id="text" placeholder="Leave empty to print a random phrase…"></textarea>
+    <button id="printBtn" class="print" disabled>Print random phrase</button>
+  </section>
+
+  <section>
+    <button id="cameraBtn" class="secondary">📷 Take photo</button>
+    <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
+    <div id="cameraView" hidden>
+      <video id="video" autoplay playsinline muted></video>
+      <div class="row">
+        <div><button id="captureBtn">Capture</button></div>
+        <div id="switchCameraWrap" hidden><button id="switchCameraBtn" class="secondary">🔄 Switch</button></div>
+        <div><button id="cancelCameraBtn" class="secondary">Cancel</button></div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="brightness">Brightness</label>
+        <input id="brightness" type="range" min="-100" max="100" value="20">
+      </div>
+      <div>
+        <label for="contrast">Contrast</label>
+        <input id="contrast" type="range" min="50" max="200" value="120">
+      </div>
+    </div>
+    <canvas id="photoPreview" class="preview" hidden></canvas>
+    <button id="printPhotoBtn" class="print" disabled>Print photo</button>
+  </section>
+</main>
+
+<div id="loader" hidden role="status" aria-live="polite">
+  <div class="orb"></div>
+  <div id="loaderText"></div>
+  <div class="progress" id="progress"><div id="progressBar"></div></div>
+  <div id="loaderDetail"></div>
+</div>
+
+<script src="phrases.js"></script>
+<script>
+// Must match the UUIDs in esp32/crystal_ball_printer/crystal_ball_printer.ino.
+const BRIDGE_SERVICE = '6e7c0001-8f1a-4c7e-9b1d-2a9c8b7f5e01';
+const JOB_CHAR = '6e7c0002-8f1a-4c7e-9b1d-2a9c8b7f5e01';
+const STATUS_CHAR = '6e7c0003-8f1a-4c7e-9b1d-2a9c8b7f5e01';
+
+const PAPER_WIDTH = 384; // 58 mm paper at 203 dpi
+const $ = (id) => document.getElementById(id);
+let jobChar = null;
+let printerOnline = false;
+let jobWaiter = null;
+let photo = null;
+let stream = null;
+let facingMode = 'environment';
+let lastPhraseIndex = -1;
+
+const decoration = new Image();
+decoration.src = 'decoration.png';
+decoration.onload = () => renderPhoto();
+
+function setStatus(msg, kind = '') {
+  $('status').textContent = msg;
+  $('status').className = kind;
+}
+
+function onBridgeStatus(status) {
+  printerOnline = status !== 'offline';
+  $('printerState').textContent = printerOnline ? 'Connected' : 'Not connected';
+  if (jobWaiter && ['done', 'error', 'busy'].includes(status)) {
+    jobWaiter(status);
+    jobWaiter = null;
+  } else if (!jobWaiter) {
+    setStatus(printerOnline ? 'ESP32 connected, printer ready' : 'ESP32 connected, printer not connected',
+              printerOnline ? 'ok' : 'err');
+  }
+  updateButtons();
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus('Web Bluetooth not supported: use Chrome (desktop or Android).', 'err');
+    return;
+  }
+  try {
+    setStatus('Searching for ESP32…');
+    const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BRIDGE_SERVICE] }] });
+    device.addEventListener('gattserverdisconnected', () => {
+      jobChar = null;
+      printerOnline = false;
+      jobWaiter?.('error');
+      jobWaiter = null;
+      updateButtons();
+      $('printerInfo').hidden = true;
+      $('connectBtn').hidden = false;
+      setStatus('ESP32 disconnected', 'err');
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(BRIDGE_SERVICE);
+    const statusChar = await service.getCharacteristic(STATUS_CHAR);
+    jobChar = await service.getCharacteristic(JOB_CHAR);
+    statusChar.addEventListener('characteristicvaluechanged', (e) => {
+      onBridgeStatus(new TextDecoder().decode(e.target.value));
+    });
+    await statusChar.startNotifications();
+    $('printerName').textContent = device.name || '(no name)';
+    $('printerInfo').hidden = false;
+    $('connectBtn').hidden = true;
+    onBridgeStatus(new TextDecoder().decode(await statusChar.readValue()));
+  } catch (e) {
+    jobChar = null;
+    setStatus('Connection failed: ' + e.message, 'err');
+  }
+}
+
+function wrapLines(ctx, text, maxWidth) {
+  const lines = [];
+  for (const paragraph of text.split('\n')) {
+    let line = '';
+    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+      const test = line ? line + ' ' + word : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+function renderText(text) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const width = PAPER_WIDTH;
+  const fontSize = 32;
+  const padding = 8;
+  const lineHeight = Math.round(fontSize * 1.25);
+  const font = `bold ${fontSize}px Georgia, serif`;
+
+  ctx.font = font;
+  const lines = wrapLines(ctx, text, width - padding * 2);
+
+  canvas.width = width;
+  canvas.height = lines.length * lineHeight + padding * 2;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#000';
+  ctx.font = font;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  lines.forEach((line, i) => {
+    ctx.fillText(line, width / 2, padding + i * lineHeight + (lineHeight - fontSize) / 2);
+  });
+  return canvas;
+}
+
+// Puts the decoration above the content and a vertically flipped copy below it.
+function addFrame(content, target = document.createElement('canvas')) {
+  const width = PAPER_WIDTH;
+  const decoHeight = decoration.naturalWidth
+    ? Math.round(decoration.naturalHeight * width / decoration.naturalWidth)
+    : 0;
+  const gap = decoHeight ? 8 : 0;
+  target.width = width;
+  target.height = content.height + (decoHeight + gap) * 2;
+  const ctx = target.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, target.width, target.height);
+  ctx.drawImage(content, 0, decoHeight + gap);
+  if (decoHeight) {
+    ctx.drawImage(decoration, 0, 0, width, decoHeight);
+    ctx.save();
+    ctx.translate(0, target.height);
+    ctx.scale(1, -1);
+    ctx.drawImage(decoration, 0, 0, width, decoHeight);
+    ctx.restore();
+  }
+  return target;
+}
+
+// Fits the photo to the paper width, applies brightness/contrast and Floyd–Steinberg dithering to pure black and white.
+function renderPhoto() {
+  if (!photo) return null;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const width = PAPER_WIDTH;
+  const height = Math.round(photo.height * width / photo.width);
+  canvas.width = width;
+  canvas.height = height;
+  ctx.drawImage(photo, 0, 0, width, height);
+
+  const brightness = parseInt($('brightness').value, 10);
+  const contrast = parseInt($('contrast').value, 10) / 100;
+  const img = ctx.getImageData(0, 0, width, height);
+  const px = img.data;
+  const gray = new Float32Array(width * height);
+  for (let i = 0; i < gray.length; i++) {
+    const lum = 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+    gray[i] = (lum - 128) * contrast + 128 + brightness;
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const value = gray[i] < 128 ? 0 : 255;
+      const err = gray[i] - value;
+      gray[i] = value;
+      if (x + 1 < width) gray[i + 1] += err * 7 / 16;
+      if (y + 1 < height) {
+        if (x > 0) gray[i + width - 1] += err * 3 / 16;
+        gray[i + width] += err * 5 / 16;
+        if (x + 1 < width) gray[i + width + 1] += err * 1 / 16;
+      }
+    }
+  }
+  for (let i = 0; i < gray.length; i++) {
+    px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = gray[i];
+    px[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  $('photoPreview').hidden = false;
+  return addFrame(canvas, $('photoPreview'));
+}
+
+// Converts a canvas to ESC/POS "GS v 0" raster commands, in bands so the printer buffer doesn't overflow.
+// The image is rotated 180° so the receipt reads correctly from the side it comes out of.
+function canvasToEscPos(canvas) {
+  const { width, height } = canvas;
+  const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+  const bytesPerRow = Math.ceil(width / 8);
+  const BAND = 128;
+  const chunks = [];
+  for (let y0 = 0; y0 < height; y0 += BAND) {
+    const rows = Math.min(BAND, height - y0);
+    const band = new Uint8Array(8 + bytesPerRow * rows);
+    band.set([0x1d, 0x76, 0x30, 0x00, bytesPerRow & 0xff, bytesPerRow >> 8, rows & 0xff, rows >> 8]);
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = ((height - 1 - (y0 + y)) * width + (width - 1 - x)) * 4;
+        const lum = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+        if (lum < 128) band[8 + y * bytesPerRow + (x >> 3)] |= 0x80 >> (x & 7);
+      }
+    }
+    chunks.push(band);
+  }
+  return chunks;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Sends a whole ESC/POS job to the ESP32, which forwards it to the printer once it is complete.
+async function sendJob(data, onProgress) {
+  const begin = new Uint8Array(5);
+  begin[0] = 0x01;
+  new DataView(begin.buffer).setUint32(1, data.length, true);
+  await jobChar.writeValueWithResponse(begin);
+  const CHUNK = 179;
+  for (let i = 0; i < data.length; i += CHUNK) {
+    const part = data.subarray(i, i + CHUNK);
+    const packet = new Uint8Array(part.length + 1);
+    packet[0] = 0x02;
+    packet.set(part, 1);
+    await jobChar.writeValueWithResponse(packet);
+    onProgress?.(Math.min(i + CHUNK, data.length) / data.length);
+  }
+}
+
+function showLoader(text, progress = null) {
+  $('loader').hidden = false;
+  $('loaderText').textContent = text;
+  $('progress').classList.toggle('indeterminate', progress === null);
+  $('progressBar').style.width = progress === null ? '' : `${Math.round(progress * 100)}%`;
+  $('loaderDetail').textContent = progress === null ? '' : `${Math.round(progress * 100)}%`;
+}
+
+function hideLoader() {
+  $('loader').hidden = true;
+}
+
+function waitForJobResult(timeoutMs = 120000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { jobWaiter = null; resolve('timeout'); }, timeoutMs);
+    jobWaiter = (result) => { clearTimeout(timer); resolve(result); };
+  });
+}
+
+async function openCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    $('photoInput').click();
+    return;
+  }
+  try {
+    stopStream();
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: false });
+    $('video').srcObject = stream;
+    $('video').classList.toggle('mirrored', facingMode === 'user');
+    $('cameraView').hidden = false;
+    $('cameraBtn').hidden = true;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    $('switchCameraWrap').hidden = devices.filter(d => d.kind === 'videoinput').length < 2;
+  } catch (e) {
+    setStatus('Camera unavailable: ' + e.message, 'err');
+    $('photoInput').click();
+  }
+}
+
+function stopStream() {
+  stream?.getTracks().forEach(t => t.stop());
+  stream = null;
+}
+
+function switchCamera() {
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+  openCamera();
+}
+
+function closeCamera() {
+  stopStream();
+  $('video').srcObject = null;
+  $('cameraView').hidden = true;
+  $('cameraBtn').hidden = false;
+}
+
+async function capturePhoto() {
+  photo = await createImageBitmap($('video'));
+  closeCamera();
+  renderPhoto();
+  updateButtons();
+}
+
+function randomPhrase() {
+  let i;
+  do { i = Math.floor(Math.random() * PHRASES.length); } while (i === lastPhraseIndex && PHRASES.length > 1);
+  lastPhraseIndex = i;
+  return PHRASES[i];
+}
+
+async function printPhrase() {
+  const typed = $('text').value.trim();
+  const printed = await printCanvas(addFrame(renderText(typed || randomPhrase())));
+  if (printed && typed) {
+    $('text').value = '';
+    updatePrintLabel();
+  }
+}
+
+function updatePrintLabel() {
+  $('printBtn').textContent = $('text').value.trim() ? 'Print phrase' : 'Print random phrase';
+}
+
+function updateButtons(busy = false) {
+  const ready = jobChar && printerOnline && !jobWaiter;
+  $('printBtn').disabled = busy || !ready;
+  $('printPhotoBtn').disabled = busy || !ready || !photo;
+}
+
+const JOB_ERRORS = {
+  error: 'the ESP32 could not print (is the printer on?)',
+  busy: 'the ESP32 is busy with another print, try again',
+  timeout: 'no answer from the ESP32',
+};
+
+async function printCanvas(canvas) {
+  if (!jobChar || !canvas) return false;
+  updateButtons(true);
+  try {
+    setStatus('Sending to ESP32…');
+    showLoader('Sending to the crystal ball…', 0);
+    const parts = [new Uint8Array([0x1b, 0x40]), ...canvasToEscPos(canvas), new Uint8Array([0x1b, 0x64, 0x04])];
+    const job = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let offset = 0;
+    for (const p of parts) { job.set(p, offset); offset += p.length; }
+
+    const result = waitForJobResult();
+    await sendJob(job, (p) => showLoader('Sending to the crystal ball…', p));
+    setStatus('Printing…');
+    showLoader('The spirits are printing…');
+    const outcome = await result;
+    if (outcome !== 'done') throw new Error(JOB_ERRORS[outcome]);
+    setStatus('Printed ✨', 'ok');
+    return true;
+  } catch (e) {
+    jobWaiter = null;
+    setStatus('Print error: ' + e.message, 'err');
+    return false;
+  } finally {
+    hideLoader();
+    updateButtons();
+  }
+}
+
+$('connectBtn').addEventListener('click', connect);
+$('printBtn').addEventListener('click', printPhrase);
+$('text').addEventListener('input', updatePrintLabel);
+$('cameraBtn').addEventListener('click', openCamera);
+$('captureBtn').addEventListener('click', capturePhoto);
+$('switchCameraBtn').addEventListener('click', switchCamera);
+$('cancelCameraBtn').addEventListener('click', closeCamera);
+$('printPhotoBtn').addEventListener('click', () => printCanvas(renderPhoto()));
+$('photoInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  photo = await createImageBitmap(file);
+  renderPhoto();
+  updateButtons();
+  e.target.value = '';
+});
+['brightness', 'contrast'].forEach(id => $(id).addEventListener('input', renderPhoto));
+</script>
+</body>
+</html>

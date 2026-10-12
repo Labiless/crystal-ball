@@ -16,7 +16,7 @@ const PHRASES = [
   "A small decision today will shape a big tomorrow.",
   "The spirits whisper your name with approval.",
   "You will soon find something you lost long ago.",
-  "Great wealth awaits you, mostly in the form of snacks.",
+  "Grea t wealth awaits you, mostly in the form of snacks.",
   "A new adventure begins the moment you say yes.",
   "Trust your instincts: they are older than you are.",
   "Someone in this room holds a secret about you.",
