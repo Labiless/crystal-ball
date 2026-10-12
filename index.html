@@ -56,10 +56,13 @@
   }
   button:disabled { opacity: .4; cursor: not-allowed; }
   button.secondary { background: #3d2763; }
+  [hidden] { display: none !important; }
+  #video { display: block; width: 100%; border-radius: 8px; margin-top: 12px; background: #000; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
   #status { font-size: .9rem; color: var(--muted); }
   #status.ok { color: var(--ok); }
   #status.err { color: var(--err); }
-  #preview {
+  canvas.preview {
     display: block;
     width: 100%;
     background: #fff;
@@ -76,11 +79,6 @@
   <section>
     <div id="status">Printer not connected</div>
     <button id="connectBtn" class="secondary">Connect printer</button>
-  </section>
-
-  <section>
-    <label for="text">Phrase to print</label>
-    <textarea id="text" placeholder="I see a long journey in your future…"></textarea>
     <div class="row">
       <div>
         <label for="width">Paper width</label>
@@ -89,13 +87,44 @@
           <option value="576">80 mm (576 dots)</option>
         </select>
       </div>
+    </div>
+  </section>
+
+  <section>
+    <label for="text">Phrase to print</label>
+    <textarea id="text" placeholder="I see a long journey in your future…"></textarea>
+    <div class="row">
       <div>
         <label for="fontSize">Text size</label>
         <input id="fontSize" type="number" min="16" max="80" value="32">
       </div>
     </div>
-    <canvas id="preview"></canvas>
-    <button id="printBtn" disabled>Print</button>
+    <canvas id="preview" class="preview"></canvas>
+    <button id="printBtn" class="print" disabled>Print phrase</button>
+  </section>
+
+  <section>
+    <button id="cameraBtn" class="secondary">📷 Take photo</button>
+    <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
+    <div id="cameraView" hidden>
+      <video id="video" autoplay playsinline muted></video>
+      <div class="row">
+        <div><button id="captureBtn">Capture</button></div>
+        <div><button id="cancelCameraBtn" class="secondary">Cancel</button></div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="brightness">Brightness</label>
+        <input id="brightness" type="range" min="-100" max="100" value="20">
+      </div>
+      <div>
+        <label for="contrast">Contrast</label>
+        <input id="contrast" type="range" min="50" max="200" value="120">
+      </div>
+    </div>
+    <canvas id="photoPreview" class="preview" hidden></canvas>
+    <button id="printPhotoBtn" class="print" disabled>Print photo</button>
   </section>
 </main>
 
@@ -112,6 +141,8 @@ const PRINTER_SERVICES = [
 
 const $ = (id) => document.getElementById(id);
 let printerChar = null;
+let photo = null;
+let stream = null;
 
 function setStatus(msg, kind = '') {
   $('status').textContent = msg;
@@ -131,7 +162,7 @@ async function connect() {
     });
     device.addEventListener('gattserverdisconnected', () => {
       printerChar = null;
-      $('printBtn').disabled = true;
+      updateButtons();
       setStatus('Printer disconnected', 'err');
     });
     const server = await device.gatt.connect();
@@ -146,7 +177,7 @@ async function connect() {
       }
     }
     if (!printerChar) throw new Error('no writable characteristic found');
-    $('printBtn').disabled = false;
+    updateButtons();
     setStatus(`Connected to ${device.name || 'printer'}`, 'ok');
   } catch (e) {
     setStatus('Connection failed: ' + e.message, 'err');
@@ -197,6 +228,49 @@ function renderText() {
   return canvas;
 }
 
+// Fits the photo to the paper width, applies brightness/contrast and Floyd–Steinberg dithering to pure black and white.
+function renderPhoto() {
+  if (!photo) return null;
+  const canvas = $('photoPreview');
+  const ctx = canvas.getContext('2d');
+  const width = parseInt($('width').value, 10);
+  const height = Math.round(photo.height * width / photo.width);
+  canvas.width = width;
+  canvas.height = height;
+  canvas.hidden = false;
+  ctx.drawImage(photo, 0, 0, width, height);
+
+  const brightness = parseInt($('brightness').value, 10);
+  const contrast = parseInt($('contrast').value, 10) / 100;
+  const img = ctx.getImageData(0, 0, width, height);
+  const px = img.data;
+  const gray = new Float32Array(width * height);
+  for (let i = 0; i < gray.length; i++) {
+    const lum = 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+    gray[i] = (lum - 128) * contrast + 128 + brightness;
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const value = gray[i] < 128 ? 0 : 255;
+      const err = gray[i] - value;
+      gray[i] = value;
+      if (x + 1 < width) gray[i + 1] += err * 7 / 16;
+      if (y + 1 < height) {
+        if (x > 0) gray[i + width - 1] += err * 3 / 16;
+        gray[i + width] += err * 5 / 16;
+        if (x + 1 < width) gray[i + width + 1] += err * 1 / 16;
+      }
+    }
+  }
+  for (let i = 0; i < gray.length; i++) {
+    px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = gray[i];
+    px[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
 // Converts a canvas to ESC/POS "GS v 0" raster commands, in bands so the printer buffer doesn't overflow.
 function canvasToEscPos(canvas) {
   const { width, height } = canvas;
@@ -235,12 +309,47 @@ async function send(data) {
   }
 }
 
-async function print() {
-  if (!printerChar) return;
-  $('printBtn').disabled = true;
+async function openCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    $('photoInput').click();
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    $('video').srcObject = stream;
+    $('cameraView').hidden = false;
+    $('cameraBtn').hidden = true;
+  } catch (e) {
+    setStatus('Camera unavailable: ' + e.message, 'err');
+    $('photoInput').click();
+  }
+}
+
+function closeCamera() {
+  stream?.getTracks().forEach(t => t.stop());
+  stream = null;
+  $('video').srcObject = null;
+  $('cameraView').hidden = true;
+  $('cameraBtn').hidden = false;
+}
+
+async function capturePhoto() {
+  photo = await createImageBitmap($('video'));
+  closeCamera();
+  renderPhoto();
+  updateButtons();
+}
+
+function updateButtons(busy = false) {
+  $('printBtn').disabled = busy || !printerChar;
+  $('printPhotoBtn').disabled = busy || !printerChar || !photo;
+}
+
+async function printCanvas(canvas) {
+  if (!printerChar || !canvas) return;
+  updateButtons(true);
   try {
     setStatus('Printing…');
-    const canvas = renderText();
     await send(new Uint8Array([0x1b, 0x40]));          // ESC @ : init
     for (const band of canvasToEscPos(canvas)) await send(band);
     await send(new Uint8Array([0x1b, 0x64, 0x04]));    // ESC d 4 : feed 4 lines
@@ -248,13 +357,27 @@ async function print() {
   } catch (e) {
     setStatus('Print error: ' + e.message, 'err');
   } finally {
-    $('printBtn').disabled = !printerChar;
+    updateButtons();
   }
 }
 
 $('connectBtn').addEventListener('click', connect);
-$('printBtn').addEventListener('click', print);
-['text', 'width', 'fontSize'].forEach(id => $(id).addEventListener('input', renderText));
+$('printBtn').addEventListener('click', () => printCanvas(renderText()));
+$('cameraBtn').addEventListener('click', openCamera);
+$('captureBtn').addEventListener('click', capturePhoto);
+$('cancelCameraBtn').addEventListener('click', closeCamera);
+$('printPhotoBtn').addEventListener('click', () => printCanvas(renderPhoto()));
+$('photoInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  photo = await createImageBitmap(file);
+  renderPhoto();
+  updateButtons();
+  e.target.value = '';
+});
+['text', 'fontSize'].forEach(id => $(id).addEventListener('input', renderText));
+['brightness', 'contrast'].forEach(id => $(id).addEventListener('input', renderPhoto));
+$('width').addEventListener('input', () => { renderText(); renderPhoto(); });
 renderText();
 </script>
 </body>
