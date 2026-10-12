@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Ball</title>
+<style>
+  :root {
+    --bg: #14091f;
+    --panel: #22123a;
+    --text: #f1e9ff;
+    --muted: #a995c9;
+    --accent: #b36bff;
+    --ok: #5fd38d;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  main { max-width: 520px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.6rem; margin: 0 0 16px; text-align: center; }
+  section {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 6px; }
+  textarea, select, input[type=number] {
+    width: 100%;
+    font: inherit;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #3d2763;
+    background: #170b29;
+    color: var(--text);
+  }
+  textarea { min-height: 100px; resize: vertical; }
+  .row { display: flex; gap: 12px; margin-top: 12px; }
+  .row > div { flex: 1; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    width: 100%;
+    padding: 12px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    margin-top: 12px;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.secondary { background: #3d2763; }
+  #status { font-size: .9rem; color: var(--muted); }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  #preview {
+    display: block;
+    width: 100%;
+    background: #fff;
+    border-radius: 4px;
+    margin-top: 12px;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>🔮 Crystal Ball</h1>
+
+  <section>
+    <div id="status">Printer not connected</div>
+    <button id="connectBtn" class="secondary">Connect printer</button>
+  </section>
+
+  <section>
+    <label for="text">Phrase to print</label>
+    <textarea id="text" placeholder="I see a long journey in your future…"></textarea>
+    <div class="row">
+      <div>
+        <label for="width">Paper width</label>
+        <select id="width">
+          <option value="384">58 mm (384 dots)</option>
+          <option value="576">80 mm (576 dots)</option>
+        </select>
+      </div>
+      <div>
+        <label for="fontSize">Text size</label>
+        <input id="fontSize" type="number" min="16" max="80" value="32">
+      </div>
+    </div>
+    <canvas id="preview"></canvas>
+    <button id="printBtn" disabled>Print</button>
+  </section>
+</main>
+
+<script>
+// Common BLE services exposed by cheap ESC/POS thermal printers.
+const PRINTER_SERVICES = [
+  '000018f0-0000-1000-8000-00805f9b34fb',
+  'e7810a71-73ae-499d-8c15-faa9aef0c3f2',
+  '49535343-fe7d-4ae5-8fa9-9fafd205e455',
+  '0000ff00-0000-1000-8000-00805f9b34fb',
+  '0000ffe0-0000-1000-8000-00805f9b34fb',
+  '0000ae30-0000-1000-8000-00805f9b34fb',
+];
+
+const $ = (id) => document.getElementById(id);
+let printerChar = null;
+
+function setStatus(msg, kind = '') {
+  $('status').textContent = msg;
+  $('status').className = kind;
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus('Web Bluetooth not supported: use Chrome (desktop or Android).', 'err');
+    return;
+  }
+  try {
+    setStatus('Searching for printer…');
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: PRINTER_SERVICES,
+    });
+    device.addEventListener('gattserverdisconnected', () => {
+      printerChar = null;
+      $('printBtn').disabled = true;
+      setStatus('Printer disconnected', 'err');
+    });
+    const server = await device.gatt.connect();
+    const services = await server.getPrimaryServices();
+    for (const service of services) {
+      const chars = await service.getCharacteristics();
+      const writable = chars.find(c => c.properties.writeWithoutResponse || c.properties.write);
+      if (writable) {
+        printerChar = writable;
+        console.log('Service:', service.uuid, 'Characteristic:', writable.uuid);
+        break;
+      }
+    }
+    if (!printerChar) throw new Error('no writable characteristic found');
+    $('printBtn').disabled = false;
+    setStatus(`Connected to ${device.name || 'printer'}`, 'ok');
+  } catch (e) {
+    setStatus('Connection failed: ' + e.message, 'err');
+  }
+}
+
+function wrapLines(ctx, text, maxWidth) {
+  const lines = [];
+  for (const paragraph of text.split('\n')) {
+    let line = '';
+    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+      const test = line ? line + ' ' + word : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+function renderText() {
+  const canvas = $('preview');
+  const ctx = canvas.getContext('2d');
+  const width = parseInt($('width').value, 10);
+  const fontSize = parseInt($('fontSize').value, 10) || 32;
+  const padding = 8;
+  const lineHeight = Math.round(fontSize * 1.25);
+  const font = `bold ${fontSize}px Georgia, serif`;
+
+  ctx.font = font;
+  const lines = wrapLines(ctx, $('text').value.trim() || ' ', width - padding * 2);
+
+  canvas.width = width;
+  canvas.height = lines.length * lineHeight + padding * 2;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#000';
+  ctx.font = font;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  lines.forEach((line, i) => {
+    ctx.fillText(line, width / 2, padding + i * lineHeight + (lineHeight - fontSize) / 2);
+  });
+  return canvas;
+}
+
+// Converts a canvas to ESC/POS "GS v 0" raster commands, in bands so the printer buffer doesn't overflow.
+function canvasToEscPos(canvas) {
+  const { width, height } = canvas;
+  const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+  const bytesPerRow = Math.ceil(width / 8);
+  const BAND = 128;
+  const chunks = [];
+  for (let y0 = 0; y0 < height; y0 += BAND) {
+    const rows = Math.min(BAND, height - y0);
+    const band = new Uint8Array(8 + bytesPerRow * rows);
+    band.set([0x1d, 0x76, 0x30, 0x00, bytesPerRow & 0xff, bytesPerRow >> 8, rows & 0xff, rows >> 8]);
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = ((y0 + y) * width + x) * 4;
+        const lum = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+        if (lum < 128) band[8 + y * bytesPerRow + (x >> 3)] |= 0x80 >> (x & 7);
+      }
+    }
+    chunks.push(band);
+  }
+  return chunks;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function send(data) {
+  const CHUNK = 180;
+  for (let i = 0; i < data.length; i += CHUNK) {
+    const part = data.slice(i, i + CHUNK);
+    if (printerChar.properties.writeWithoutResponse) {
+      await printerChar.writeValueWithoutResponse(part);
+      await sleep(20);
+    } else {
+      await printerChar.writeValueWithResponse(part);
+    }
+  }
+}
+
+async function print() {
+  if (!printerChar) return;
+  $('printBtn').disabled = true;
+  try {
+    setStatus('Printing…');
+    const canvas = renderText();
+    await send(new Uint8Array([0x1b, 0x40]));          // ESC @ : init
+    for (const band of canvasToEscPos(canvas)) await send(band);
+    await send(new Uint8Array([0x1b, 0x64, 0x04]));    // ESC d 4 : feed 4 lines
+    setStatus('Printed ✨', 'ok');
+  } catch (e) {
+    setStatus('Print error: ' + e.message, 'err');
+  } finally {
+    $('printBtn').disabled = !printerChar;
+  }
+}
+
+$('connectBtn').addEventListener('click', connect);
+$('printBtn').addEventListener('click', print);
+['text', 'width', 'fontSize'].forEach(id => $(id).addEventListener('input', renderText));
+renderText();
+</script>
+</body>
+</html>
