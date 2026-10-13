@@ -1,9 +1,10 @@
 // Crystal Ball – prints a random fortune on a BLE ESC/POS thermal printer when the button is pressed,
 // and forwards print jobs from the webapp (esp32.html) to the same printer.
-// Requires the "NimBLE-Arduino" (version 2.x) and "Adafruit GFX Library" libraries.
+// Requires the "NimBLE-Arduino" (version 2.x), "Adafruit GFX Library" and "Adafruit NeoPixel" libraries.
 
 #include <NimBLEDevice.h>
 #include <Adafruit_GFX.h>
+#include <Adafruit_NeoPixel.h>
 #include <Fonts/FreeSerifBold18pt7b.h>
 #include <vector>
 #include <atomic>
@@ -19,7 +20,17 @@ const char* JOB_CHAR_UUID       = "6e7c0002-8f1a-4c7e-9b1d-2a9c8b7f5e01";
 const char* STATUS_CHAR_UUID    = "6e7c0003-8f1a-4c7e-9b1d-2a9c8b7f5e01";
 const size_t MAX_JOB_SIZE = 100 * 1024;
 
-const int BUTTON_PIN = 4;
+const int BUTTON_PIN = 12;
+const unsigned long LONG_PRESS_MS = 2000;      // hold the button this long to print
+const unsigned long ANIMATION_RAMP_MS = 7000;   // slow-to-fast build-up; the button waits this long before printing
+const unsigned long ANIMATION_FADE_IN_MS = 400;
+const unsigned long ANIMATION_FADE_OUT_MS = 2000;
+
+const int STRIP_PIN = 13;              // WS2811 strip Din (through a 330 Ω resistor)
+const int STRIP_PIXELS = 9;            // each WS2811 pixel drives 3 LEDs
+const int PIXELS_PER_TURN = 9;         // pixels in one full wrap around the cylinder
+const int ROTATION_DIRECTION = 1;      // 1 or -1 to reverse the spin
+const uint8_t STRIP_BRIGHTNESS = 200;   // 0–255
 const int PAPER_WIDTH = 384;     // 58 mm paper at 203 dpi
 
 #ifndef RGB_BUILTIN
@@ -239,6 +250,74 @@ void printFortune() {
   printCanvas(canvas);
 }
 
+// ---------- LED strip ----------
+// The animation runs in its own task so it keeps moving while the main loop is blocked printing.
+
+Adafruit_NeoPixel strip(STRIP_PIXELS, STRIP_PIN, NEO_RGB + NEO_KHZ800);
+std::atomic<bool> buttonAnimation{false};
+std::atomic<bool> jobAnimation{false};
+
+// A yellow comet with a fading tail spinning around the cylinder over a dim purple glow. It starts slow,
+// speeds up over ANIMATION_RAMP_MS, keeps its top speed while printing, and fades out once the print is over.
+void stripTask(void*) {
+  const float PURPLE[] = {140, 0, 255};
+  const float YELLOW[] = {255, 170, 0};
+  const float BACKGROUND = 0.25f;  // purple glow level away from the comet
+  const float MIN_SPEED = 0.2f;    // turns per second
+  const float MAX_SPEED = 2.5f;
+
+  float position = 0, speed = MIN_SPEED, level = 0;
+  bool wasActive = false, lit = false;
+  unsigned long startedAt = 0, last = millis();
+
+  for (;;) {
+    unsigned long now = millis();
+    float dt = (now - last) / 1000.0f;
+    last = now;
+
+    bool active = buttonAnimation || jobAnimation;
+    if (active && !wasActive) startedAt = now;
+    wasActive = active;
+
+    if (active) {
+      float progress = min(1.0f, (now - startedAt) / (float)ANIMATION_RAMP_MS);
+      speed = MIN_SPEED + (MAX_SPEED - MIN_SPEED) * progress * progress;
+      level = min(1.0f, level + dt * 1000.0f / ANIMATION_FADE_IN_MS);
+    } else {
+      level = max(0.0f, level - dt * 1000.0f / ANIMATION_FADE_OUT_MS);
+    }
+
+    if (level > 0 || lit) {
+      position = fmodf(position + speed * dt, 1.0f);
+      for (int i = 0; i < STRIP_PIXELS; i++) {
+        float angle = (float)(i % PIXELS_PER_TURN) / PIXELS_PER_TURN;
+        if (ROTATION_DIRECTION < 0) angle = 1.0f - angle;
+        float behind = fmodf(position - angle + 1.0f, 1.0f);   // 0 = at the comet head, near 1 = just ahead of it
+        float tail = powf(1.0f - behind, 3.0f);
+        float ahead = max(0.0f, 1.0f - (1.0f - behind) * PIXELS_PER_TURN);  // smooths the head between pixels
+        float comet = max(tail, ahead);
+        uint8_t c[3];
+        for (int k = 0; k < 3; k++) {
+          float purple = PURPLE[k] * BACKGROUND * (1.0f - comet);
+          c[k] = (purple + YELLOW[k] * comet) * level;
+        }
+        strip.setPixelColor(i, c[0], c[1], c[2]);
+      }
+      strip.show();
+      lit = level > 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+void startStrip() {
+  strip.begin();
+  strip.setBrightness(STRIP_BRIGHTNESS);
+  strip.clear();
+  strip.show();
+  xTaskCreatePinnedToCore(stripTask, "strip", 4096, nullptr, 1, nullptr, 1);
+}
+
 // ---------- Webapp bridge ----------
 // The webapp sends a complete ESC/POS job on the job characteristic:
 //   [0x01, size as uint32 little-endian]  starts a job
@@ -281,6 +360,7 @@ class JobCallbacks : public NimBLECharacteristicCallbacks {
         return;
       }
       jobSize = size;
+      jobAnimation = true;
     } else if (data[0] == 0x02 && jobBuffer) {
       size_t n = min(len - 1, jobSize - jobReceived);
       memcpy(jobBuffer + jobReceived, data + 1, n);
@@ -296,7 +376,10 @@ class BridgeServerCallbacks : public NimBLEServerCallbacks {
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
     Serial.println("Webapp disconnected.");
-    if (!jobReady) discardJob();
+    if (!jobReady) {
+      discardJob();
+      jobAnimation = false;
+    }
   }
 };
 
@@ -331,6 +414,7 @@ void printPendingJob() {
   }
   discardJob();
   jobReady = false;
+  jobAnimation = false;
 }
 
 // ---------- LED ----------
@@ -358,6 +442,7 @@ void setup() {
 #endif
   NimBLEDevice::init(BRIDGE_NAME);
   NimBLEDevice::setMTU(517);
+  startStrip();
   startBridge();
   connectToPrinter();
 }
@@ -366,6 +451,8 @@ void loop() {
   static unsigned long lastRetry = 0;
   static bool lastPressed = false;
   static unsigned long lastChange = 0;
+  static unsigned long pressedSince = 0;
+  static bool longPressHandled = false;
   static int lastPrinterState = -1;
 
   int printerState = isConnected();
@@ -386,10 +473,22 @@ void loop() {
     lastChange = millis();
     lastPressed = pressed;
     if (pressed) {
-      Serial.println("Button pressed.");
+      Serial.println("Button pressed, hold to print...");
       nextLedColor();
-      if (isConnected()) printFortune();
-      else Serial.println("Button pressed, but the printer is not connected.");
+      pressedSince = millis();
+      longPressHandled = false;
+    }
+  }
+
+  if (lastPressed && !longPressHandled && millis() - pressedSince >= LONG_PRESS_MS) {
+    longPressHandled = true;
+    if (isConnected()) {
+      buttonAnimation = true;
+      delay(ANIMATION_RAMP_MS);
+      printFortune();
+      buttonAnimation = false;
+    } else {
+      Serial.println("Long press, but the printer is not connected.");
     }
   }
 }
